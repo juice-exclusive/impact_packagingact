@@ -1,0 +1,109 @@
+---
+title: "Supply-side: Data Exploration"
+format:
+  html:
+    toc: true
+    toc-location: left
+---
+
+# Setup -------------------------------------------------------------------------------------
+```{r}
+#| echo: false
+#| message: false
+#| warning: false
+
+if (!requireNamespace("pacman", quietly = TRUE)) {
+  install.packages("pacman", repos = "https://cran.rstudio.com/")
+}
+pacman::p_load(tidyr, dplyr, ggplot2, lubridate, tibble, stringr,
+               knitr, sf, giscoR, patchwork)
+```
+
+# Import ------------------------------------------------------------------------------------
+```{r}
+#| echo: false
+load("../data/processed/model2_data.RData")
+```
+
+# Preprocess --------------------------------------------------------------------------------
+```{r}
+#| echo: false
+
+# Add log-transformed outcome and select snapshot months
+Nuts3input <- model2_data %>%
+  mutate(log_active_per_100k = log(active_per_100k))
+
+Nuts3input_before <- Nuts3input %>%
+  filter(month == "2022-03-01") %>%
+  select(NUTS3, nuts3_name, lage_typ, month, active_per_100k, log_active_per_100k)
+
+Nuts3input_after <- Nuts3input %>%
+  filter(month == "2023-03-01") %>%
+  select(NUTS3, nuts3_name, lage_typ, month, active_per_100k, log_active_per_100k)
+```
+
+# Map geometry ------------------------------------------------------------------------------
+```{r}
+#| echo: false
+#| message: false
+
+germany <- gisco_get_nuts(year = "2021", epsg = "4326", resolution = "20", nuts_level = 3)
+de_map  <- subset(germany, CNTR_CODE == "DE")
+```
+
+# Categorize outcome ------------------------------------------------------------------------
+```{r}
+#| echo: false
+
+breaks <- c(0, 6, 12, 18, 24, 30, 36, 42, Inf)
+labels <- c("0-6", "7-12", "13-18", "19-24", "25-30", "31-36", "37-42", ">42")
+
+de_map_before <- de_map %>%
+  left_join(Nuts3input_before, by = c("NUTS_ID" = "NUTS3")) %>%
+  mutate(active_cut = cut(active_per_100k, breaks = breaks, labels = labels,
+                          include.lowest = TRUE))
+
+de_map_after <- de_map %>%
+  left_join(Nuts3input_after, by = c("NUTS_ID" = "NUTS3")) %>%
+  mutate(active_cut = cut(active_per_100k, breaks = breaks, labels = labels,
+                          include.lowest = TRUE))
+```
+
+# Figure: RPS diffusion map -----------------------------------------------------------------
+```{r}
+#| label: fig-map
+#| fig-cap: "**RPS partner availability across German NUTS-3 regions before and after mandate implementation.** a, Active RPS partners per 100,000 inhabitants in March 2022 (pre-mandate). b, Active RPS partners per 100,000 inhabitants in March 2023 (post-mandate). Darker shading indicates higher partner density; n = 394 NUTS-3 regions."
+#| fig-width: 10
+#| fig-dpi: 300
+#| warning: false
+#| echo: false
+
+p1 <- ggplot(de_map_before) +
+  geom_sf(aes(fill = active_cut), color = "white", linewidth = 0.3) +
+  scale_fill_brewer(
+    name = "Active RPS partners per 100k inhabitants",
+    palette = "Blues",
+    direction = 1,
+    na.value = "grey85",
+    drop = FALSE
+  ) +
+  labs(title = "2022") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, size = 14))
+
+p2 <- ggplot(de_map_after) +
+  geom_sf(aes(fill = active_cut), color = "white", linewidth = 0.3) +
+  scale_fill_brewer(
+    name = "Active RPS partners per 100k inhabitants",
+    palette = "Blues",
+    direction = 1,
+    na.value = "grey85",
+    drop = FALSE
+  ) +
+  labs(title = "2023") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, size = 14))
+
+(p1 + p2 + plot_layout(guides = "collect")) &
+  theme(legend.position = "right")
+```

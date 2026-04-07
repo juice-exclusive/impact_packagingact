@@ -1,0 +1,268 @@
+---
+title: "Usage: Store-level Cohort Analysis"
+format:
+  html:
+    toc: true
+    toc-location: left
+---
+
+# Setup -------------------------------------------------------------------------------------
+```{r}
+#| echo: false
+#| message: false
+#| warning: false
+
+if (!requireNamespace("pacman", quietly = TRUE)) {
+  install.packages("pacman", repos = "https://cran.rstudio.com/")
+}
+pacman::p_load(tidyr, dplyr, ggplot2, lubridate, tibble, stringr,
+               knitr, broom, fixest, here)
+```
+
+# Import ------------------------------------------------------------------------------------
+```{r}
+#| echo: false
+# Load anonymized store-level data
+# Note: StoreName, StreetAddress, ZipCode, City, Longitude, Latitude are not present
+load("../data/u_processed/monthly_panel_stores_AT_DE_FR.RData")
+stores_panel <- monthly_panel_stores_AT_DE_FR
+```
+
+# Preprocess: Build complete store-month panel ----------------------------------------------
+```{r}
+#| echo: false
+
+# Extract unique German stores (fields available in anonymized data)
+all_stores <- stores_panel %>%
+  filter(Country == "DE") %>%
+  distinct(MerchantStoreID, MerchantID, CategoryID, StoreCategory,
+           Country, StoreCreationDate, StoreContractedDate,
+           StoreOnboardedDate, ContractEndDate, NUTS3)
+
+# All observation months
+all_months <- tibble(
+  Month = seq(as.Date("2019-01-01"), as.Date("2024-12-01"), by = "month")
+)
+
+# Cross-join: every store × every month, filtered to active contract period
+store_month_grid <- all_stores %>%
+  cross_join(all_months) %>%
+  filter(
+    Month >= floor_date(StoreOnboardedDate, "month"),
+    is.na(ContractEndDate) | Month <= floor_date(ContractEndDate, "month")
+  )
+
+# Existing transactions
+existing_checkouts <- stores_panel %>%
+  filter(Country == "DE") %>%
+  select(MerchantStoreID, Month, CheckoutCount)
+
+# Join — missing months get 0 transactions
+panel_stores_DE_complete <- store_month_grid %>%
+  left_join(existing_checkouts, by = c("MerchantStoreID", "Month")) %>%
+  mutate(CheckoutCount = replace_na(CheckoutCount, 0))
+```
+
+# Add variables: cohort, chain type, tenure -------------------------------------------------
+```{r}
+#| echo: false
+
+panel_stores_DE_complete <- panel_stores_DE_complete %>%
+  mutate(
+    cohort = case_when(
+      StoreOnboardedDate < "2021-01-01" ~ "2020_or_earlier",
+      StoreOnboardedDate < "2022-01-01" ~ "2021",
+      StoreOnboardedDate < "2022-07-01" ~ "2022_H1",
+      StoreOnboardedDate < "2023-01-01" ~ "2022_H2",
+      StoreOnboardedDate < "2023-07-01" ~ "2023_H1",
+      TRUE                              ~ "2023_H2"
+    ),
+    chain_type = case_when(
+      StoreCategory %in% c("NATIONAL_CHAIN", "INTERNATIONAL_CHAIN")               ~ "Chain",
+      StoreCategory %in% c("NATIONAL_CATERING_COMPANY",
+                           "INTERNATIONAL_CATERING_COMPANY")                      ~ "Catering",
+      StoreCategory %in% c("UNIVERSITY_CANTEEN", "SELF_OPERATED_CANTEEN")         ~ "Canteen",
+      StoreCategory %in% c("RETAIL_CHAIN")                                        ~ "Retail",
+      TRUE                                                                         ~ "Independent"
+    ),
+    month_store             = floor_date(StoreOnboardedDate, "month"),
+    month_obs               = floor_date(Month, "month"),
+    months_since_onboarding = 12 * (year(month_obs) - year(month_store)) +
+                              (month(month_obs) - month(month_store)),
+    moy  = factor(month(Month)),
+    year = factor(year(month_obs))
+  )
+
+# Remove early (pre-2021) and right-censored (2023-H2) cohorts
+panel_stores_DE_complete <- panel_stores_DE_complete %>%
+  filter(cohort != "2020_or_earlier", cohort != "2023_H2")
+```
+
+# Descriptive Statistics --------------------------------------------------------------------
+```{r}
+#| echo: false
+
+# Cohort tenure trajectories (median transactions)
+cohort_comparison <- panel_stores_DE_complete %>%
+  filter(months_since_onboarding >= 0, months_since_onboarding <= 12) %>%
+  group_by(cohort, months_since_onboarding) %>%
+  summarise(
+    mean_transactions   = mean(CheckoutCount, na.rm = TRUE),
+    median_transactions = median(CheckoutCount, na.rm = TRUE),
+    pct_zero            = mean(CheckoutCount == 0, na.rm = TRUE),
+    n_stores            = n_distinct(MerchantStoreID),
+    .groups = "drop"
+  )
+
+# Okabe-Ito colors for cohorts
+cohort_colors <- c(
+  "2021"    = "#0072B2",
+  "2022_H1" = "#56B4E9",
+  "2022_H2" = "#E69F00",
+  "2023_H1" = "#D55E00"
+)
+
+# Save median-transactions plot for supplement
+p_median_transactions <- ggplot(cohort_comparison,
+                                aes(x = months_since_onboarding,
+                                    y = median_transactions,
+                                    color = cohort)) +
+  geom_line(linewidth = 1) +
+  geom_point() +
+  scale_color_manual(values = cohort_colors) +
+  labs(x = "Months since onboarding",
+       y = "Median container transactions") +
+  theme_minimal()
+
+ggsave(here::here("assets", "objects", "fig-median-transactions.png"),
+       plot = p_median_transactions, width = 10, height = 6, dpi = 300)
+```
+
+# Main Model: Poisson TWFE ------------------------------------------------------------------
+```{r}
+#| echo: false
+
+mod_onb_0_12 <- fepois(
+  CheckoutCount ~ cohort + chain_type | moy + NUTS3 + months_since_onboarding,
+  cluster = ~ MerchantStoreID + NUTS3,
+  data    = panel_stores_DE_complete %>%
+    filter(months_since_onboarding >= 0, months_since_onboarding <= 12)
+)
+```
+
+# Save model outputs ------------------------------------------------------------------------
+```{r}
+#| echo: false
+
+# Raw coefficient table
+cohort_coef_table <- as.data.frame(coeftable(mod_onb_0_12))
+cohort_coef_table$Term <- rownames(cohort_coef_table)
+cohort_coef_table <- cohort_coef_table %>%
+  select(Term, Estimate, `Std. Error`, `z value`, `Pr(>|z|)`) %>%
+  rename(SE = `Std. Error`, z = `z value`, p = `Pr(>|z|)`)
+
+dir.create(here::here("assets", "objects"), recursive = TRUE, showWarnings = FALSE)
+saveRDS(cohort_coef_table, here("assets", "objects", "cohort_coef_table.rds"))
+
+# Model statistics
+cohort_model_stats <- list(
+  n_obs    = nobs(mod_onb_0_12),
+  n_stores = n_distinct(
+    panel_stores_DE_complete %>%
+      filter(months_since_onboarding >= 0, months_since_onboarding <= 12) %>%
+      pull(MerchantStoreID)
+  ),
+  pseudo_r2 = fitstat(mod_onb_0_12, "pr2")[[1]],
+  loglik    = as.numeric(logLik(mod_onb_0_12)),
+  bic       = BIC(mod_onb_0_12)
+)
+saveRDS(cohort_model_stats, here("assets", "objects", "cohort_model_stats.rds"))
+```
+
+# Table: Cohort Analysis (in-notebook view) -------------------------------------------------
+```{r}
+#| label: tbl-cohort-full1
+#| tbl-cap: "**Cohort analysis: transaction activity by adoption cohort and establishment type.** Poisson fixed-effects regression; outcome is monthly container transactions per store. Reference categories: 2021 adoption cohort; canteen establishment type. ***P < 0.01; **P < 0.05; *P < 0.1."
+#| echo: false
+
+stars_fixest <- function(p) {
+  ifelse(is.na(p), "",
+         ifelse(p < 0.001, "***",
+                ifelse(p < 0.01, "**",
+                       ifelse(p < 0.05, "*",
+                              ifelse(p < 0.1, "†", "")))))
+}
+
+var_labels <- c(
+  "cohort2022_H1"      = "Cohort: 2022-H1",
+  "cohort2022_H2"      = "Cohort: 2022-H2",
+  "cohort2023_H1"      = "Cohort: 2023-H1",
+  "chain_typeCatering" = "Type: Catering",
+  "chain_typeChain"    = "Type: Chain",
+  "chain_typeIndependent" = "Type: Independent",
+  "chain_typeRetail"   = "Type: Retail"
+)
+
+ct_df <- as.data.frame(coeftable(mod_onb_0_12))
+ct_df$term <- rownames(ct_df)
+
+se_col <- grep("Std", names(ct_df), value = TRUE)[1]
+p_col  <- grep("^Pr", names(ct_df), value = TRUE)[1]
+
+rows_coef <- ct_df %>%
+  transmute(
+    Term  = recode(term, !!!var_labels, .default = term),
+    Value = sprintf("%.3f%s (%.3f)", Estimate, stars_fixest(.data[[p_col]]),
+                    .data[[se_col]])
+  )
+
+rows_ref <- tibble(
+  Term  = c("Cohort: 2021 (ref.)", "Type: Canteen (ref.)"),
+  Value = c("—", "—")
+)
+
+cohort_rows <- rows_coef %>% filter(grepl("^Cohort:", Term))
+type_rows   <- rows_coef %>% filter(grepl("^Type:", Term))
+
+rows_ordered <- bind_rows(
+  rows_ref %>% filter(grepl("Cohort", Term)),
+  cohort_rows,
+  rows_ref %>% filter(grepl("Type", Term)),
+  type_rows
+)
+
+rows_fe <- tibble(
+  Term  = c("Month-of-year FE", "Region (NUTS-3) FE", "Months since onboarding FE"),
+  Value = c("Yes", "Yes", "Yes")
+)
+
+rows_stats <- tibble(
+  Term  = c("Observations", "Log Likelihood", "BIC"),
+  Value = c(
+    format(nobs(mod_onb_0_12), big.mark = ","),
+    sprintf("%.2f", as.numeric(logLik(mod_onb_0_12))),
+    sprintf("%.2f", BIC(mod_onb_0_12))
+  )
+)
+
+tab_export <- bind_rows(
+  rows_ordered,
+  tibble(Term = "", Value = ""),
+  tibble(Term = "Fixed Effects", Value = ""),
+  rows_fe,
+  tibble(Term = "", Value = ""),
+  rows_stats,
+  tibble(Term = "", Value = ""),
+  tibble(Term = "Note: Standard errors clustered by restaurant and NUTS-3 region.", Value = ""),
+  tibble(Term = "†p < 0.1; *p < 0.05; **p < 0.01; ***p < 0.001", Value = "")
+)
+
+knitr::kable(
+  tab_export,
+  format     = "pipe",
+  escape     = FALSE,
+  row.names  = FALSE,
+  col.names  = c("", "Months 0-12"),
+  align      = c("l", "r")
+)
+```

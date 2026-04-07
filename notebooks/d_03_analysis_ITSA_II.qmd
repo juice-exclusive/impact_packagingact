@@ -1,0 +1,247 @@
+---
+title: "Supply-side: ITSA Analysis"
+format:
+  html:
+    toc: true
+    toc-location: left
+    html-table-processing: none
+---
+
+# Setup -------------------------------------------------------------------------------------
+```{r}
+#| echo: false
+#| message: false
+#| warning: false
+
+if (!requireNamespace("pacman", quietly = TRUE)) {
+  install.packages("pacman", repos = "https://cran.rstudio.com/")
+}
+pacman::p_load(tidyr, dplyr, ggplot2, lubridate, tibble, stringr,
+               knitr, kableExtra, broom, fixest, lme4, nlme, clubSandwich, here)
+```
+
+# Import ------------------------------------------------------------------------------------
+```{r}
+#| echo: false
+
+load("../data/processed/model2_data.RData")
+
+# Log-transform outcome, restrict to German NUTS-3 regions
+model2_data_extended <- model2_data %>%
+  mutate(log_active_per_100k = log(active_per_100k)) %>%
+  filter(str_starts(NUTS3, "DE"))
+```
+
+# Figure: RPS partner density over time -----------------------------------------------------
+```{r}
+#| label: fig-plot-mean
+#| fig-cap: "**RPS partner density rose at mandate implementation and subsequently declined across all urbanization levels.** Mean active RPS partners per 100,000 inhabitants per month for German NUTS-3 regions stratified by urbanization level and Austrian control regions. Lines represent group means; grey shaded area indicates the anticipation period (October-December 2022); vertical dashed line marks mandate implementation (January 2023). n = 394 German regions; n = 6 Austrian control regions."
+#| fig-width: 8
+#| fig-asp: 0.65
+#| fig-dpi: 300
+#| out-width: "90%"
+#| warning: false
+#| echo: false
+
+df_plot_mean <- model2_data %>%
+  filter(month >= as.Date("2021-09-01"),
+         month <= as.Date("2024-12-01")) %>%
+  group_by(country, lage_typ, month) %>%
+  summarise(
+    active_per_100k = mean(active_per_100k, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(color_group = ifelse(country == "AT", "AT", lage_typ))
+
+# ColorBrewer Blues for DE urbanization levels + Okabe-Ito vermillion for AT
+colors <- c(
+  "metropolitan" = "#c6dbef",
+  "very central" = "#9ecae1",
+  "central"      = "#6baed6",
+  "rural"        = "#2171b5",
+  "very rural"   = "#084594",
+  "AT"           = "#D55E00"
+)
+
+ggplot(df_plot_mean, aes(x = month, y = active_per_100k,
+                         group = color_group, color = color_group)) +
+  annotate("rect",
+           xmin = as.Date("2022-11-01"), xmax = as.Date("2023-01-01"),
+           ymin = -Inf, ymax = Inf,
+           fill = "grey60", alpha = 0.15) +
+  annotate("text",
+           x = as.Date("2022-08-01") + 5, y = Inf,
+           label = "Anticipation",
+           hjust = 0, vjust = 1.2,
+           color = "grey20", fontface = "bold", size = 4) +
+  geom_line(linewidth = 1) +
+  geom_vline(xintercept = as.Date("2023-01-01"),
+             linetype = "dashed", linewidth = 0.7, color = "grey40") +
+  scale_color_manual(
+    values = colors,
+    name   = "Location type / country",
+    breaks = c("metropolitan", "very central", "central", "rural", "very rural", "AT"),
+    labels = c("Metropolitan (DE)", "Very central (DE)", "Central (DE)",
+               "Rural (DE)", "Very rural (DE)", "Austria (AT)")
+  ) +
+  scale_x_date(date_breaks = "3 months", date_labels = "%Y-%m") +
+  labs(x = "Month", y = "Average active partners per 100,000 inhabitants") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom",
+        axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+# Preprocess: Add ITSA time variables -------------------------------------------------------
+```{r}
+#| echo: false
+#| message: false
+#| warning: false
+
+model2_data_extended <- model2_data_extended %>%
+  arrange(month) %>%
+  mutate(
+    time       = lubridate::interval(as.Date("2021-03-01"), month) %/% months(1),
+    month_name = factor(month(month, label = TRUE, abbr = TRUE)),
+    anticipation = if_else(time %in% c(19, 20, 21), 1, 0),
+    intervention = if_else(time >= 22, 1, 0),
+    timeafter    = if_else(time >= 21, time - 21, 0)
+  )
+```
+
+# Model: Sequential model building (REML = FALSE for LRT) -----------------------------------
+```{r}
+#| label: itsa-model-hierarchy
+#| echo: false
+#| message: false
+#| warning: false
+
+# FM_1: Basic ITSA (Bernal standard)
+fm_1 <- lmer(
+  log_active_per_100k ~ time + intervention + timeafter +
+    (1 + time + timeafter | NUTS3),
+  data = model2_data_extended, REML = FALSE
+)
+
+# FM_2: + Anticipation
+fm_2 <- lmer(
+  log_active_per_100k ~ time + anticipation + intervention + timeafter +
+    (1 + time + timeafter | NUTS3),
+  data = model2_data_extended, REML = FALSE
+)
+
+# FM_3: + Quadratic terms (maturation/ceiling effects)
+fm_3 <- lmer(
+  log_active_per_100k ~ time + I(time^2) + anticipation +
+    intervention + timeafter + I(timeafter^2) +
+    (1 + time + timeafter | NUTS3),
+  data = model2_data_extended, REML = FALSE
+)
+
+# FM_4: + Region-type main effect
+fm_4 <- lmer(
+  log_active_per_100k ~ time + I(time^2) + anticipation +
+    intervention + timeafter + I(timeafter^2) + lage_typ +
+    (1 + time + timeafter | NUTS3),
+  data = model2_data_extended, REML = FALSE
+)
+
+# FM_5: + Region-type × policy interactions
+fm_5 <- lmer(
+  log_active_per_100k ~ time + I(time^2) + anticipation +
+    intervention * lage_typ + timeafter * lage_typ + I(timeafter^2) +
+    (1 + time + timeafter | NUTS3),
+  data = model2_data_extended, REML = FALSE
+)
+
+# FM_6: Full model (all region-type interactions)
+fm_6 <- lmer(
+  log_active_per_100k ~
+    time * lage_typ + I(time^2) * lage_typ + anticipation +
+    intervention * lage_typ + timeafter * lage_typ + I(timeafter^2) * lage_typ +
+    (1 + time + timeafter | NUTS3),
+  data = model2_data_extended, REML = FALSE
+)
+
+# Final model estimated with REML
+fm_final <- lmer(
+  log_active_per_100k ~
+    time * lage_typ + I(time^2) * lage_typ + anticipation +
+    intervention * lage_typ + timeafter * lage_typ + I(timeafter^2) * lage_typ +
+    (1 + time + timeafter | NUTS3),
+  data = model2_data_extended, REML = TRUE
+)
+```
+
+# Save model outputs ------------------------------------------------------------------------
+```{r}
+#| label: itsa-save-for-supplement
+#| echo: false
+
+library(clubSandwich)
+
+# Model selection table
+model_selection <- tibble(
+  Model = c("1: Basic ITSA",
+            "2: + Anticipation",
+            "3: + Maturation",
+            "4: + Region main effect",
+            "5: + Region x Policy",
+            "6: Full model"),
+  Description = c(
+    "Level and slope change only",
+    "Adds anticipation period",
+    "Adds curvilinear terms (time2, timeafter2)",
+    "Adds baseline differences by urbanization",
+    "Adds heterogeneous policy effects by region",
+    "Full regional heterogeneity in trends"
+  ),
+  df     = c(extractAIC(fm_1)[1], extractAIC(fm_2)[1], extractAIC(fm_3)[1],
+             extractAIC(fm_4)[1], extractAIC(fm_5)[1], extractAIC(fm_6)[1]),
+  AIC    = c(AIC(fm_1), AIC(fm_2), AIC(fm_3), AIC(fm_4), AIC(fm_5), AIC(fm_6)),
+  BIC    = c(BIC(fm_1), BIC(fm_2), BIC(fm_3), BIC(fm_4), BIC(fm_5), BIC(fm_6)),
+  logLik = c(as.numeric(logLik(fm_1)), as.numeric(logLik(fm_2)),
+             as.numeric(logLik(fm_3)), as.numeric(logLik(fm_4)),
+             as.numeric(logLik(fm_5)), as.numeric(logLik(fm_6))),
+  LRT_p  = c(NA,
+             anova(fm_1, fm_2)$`Pr(>Chisq)`[2],
+             anova(fm_2, fm_3)$`Pr(>Chisq)`[2],
+             anova(fm_3, fm_4)$`Pr(>Chisq)`[2],
+             anova(fm_4, fm_5)$`Pr(>Chisq)`[2],
+             anova(fm_5, fm_6)$`Pr(>Chisq)`[2])
+)
+
+# Cluster-robust coefficient table (CR2)
+itsa_coef_table <- coef_test(
+  fm_final,
+  vcov    = "CR2",
+  cluster = model2_data_extended$NUTS3
+) %>%
+  as.data.frame() %>%
+  transmute(
+    Term     = Coef,
+    Estimate = beta,
+    SE       = SE,
+    t        = tstat,
+    df       = df_Satt,
+    p        = p_Satt
+  )
+
+itsa_random_effects <- as.data.frame(VarCorr(fm_final))
+
+itsa_model_stats <- list(
+  n_obs    = nobs(fm_final),
+  n_groups = ngrps(fm_final),
+  AIC      = AIC(fm_final),
+  BIC      = BIC(fm_final),
+  logLik   = as.numeric(logLik(fm_final))
+)
+
+dir.create(here::here("assets", "objects"), recursive = TRUE, showWarnings = FALSE)
+
+saveRDS(fm_final,             here::here("assets", "objects", "fm_itsa_final.rds"))
+saveRDS(model_selection,      here::here("assets", "objects", "itsa_model_selection.rds"))
+saveRDS(itsa_coef_table,      here::here("assets", "objects", "itsa_coef_table.rds"))
+saveRDS(itsa_random_effects,  here::here("assets", "objects", "itsa_random_effects.rds"))
+saveRDS(itsa_model_stats,     here::here("assets", "objects", "itsa_model_stats.rds"))
+saveRDS(model2_data_extended, here::here("assets", "objects", "model2_data_extended.rds"))
+```

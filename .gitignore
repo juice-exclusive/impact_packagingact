@@ -1,0 +1,18 @@
+# Quarto render cache
+_freeze/
+.quarto/
+_manuscript/
+*_files/
+*.html
+*.pdf
+*.docx
+
+# R
+.Rhistory
+.RData
+.Rproj.user/
+*.Rproj
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,0 +1,181 @@
+---
+title: "Mechanism Figure: Munich vs. Vienna"
+format:
+  html:
+    echo: false
+---
+
+# Setup -------------------------------------------------------------------------------------
+```{r setup}
+#| include: false
+if (!requireNamespace("pacman", quietly = TRUE)) install.packages("pacman")
+pacman::p_load(tidyverse, lubridate, here, ggplot2, patchwork, scales)
+```
+
+# Import & Preprocess -----------------------------------------------------------------------
+```{r build-data}
+#| include: false
+
+load(here("data", "u_processed", "monthly_panel_nuts3_AT_DE_FR.RData"))
+
+t0                    <- as.Date("2023-01-01")
+pre_window            <- 4
+post_window           <- 12
+min_pre_active_months <- 4
+min_pre_mean_outlets  <- 2
+min_first_active_date <- as.Date("2022-01-01")
+
+step1 <- monthly_panel_nuts3_AT_DE_FR %>%
+  mutate(Month = as.Date(Month)) %>%
+  filter(Country %in% c("DE", "AT"))
+
+step2 <- step1 %>%
+  group_by(NUTS3, Country, Month) %>%
+  summarise(
+    CheckoutCount   = sum(CheckoutCount, na.rm = TRUE),
+    n_stores        = sum(n_stores, na.rm = TRUE),
+    n_stores_active = sum(n_stores_active, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+all_months <- sort(unique(step2$Month))
+nuts3_ids  <- step2 %>% distinct(NUTS3, Country)
+
+step3 <- tidyr::expand_grid(nuts3_ids, Month = all_months) %>%
+  left_join(step2, by = c("NUTS3", "Country", "Month")) %>%
+  mutate(across(c(CheckoutCount, n_stores, n_stores_active), ~replace_na(., 0L)))
+
+step4 <- step3 %>%
+  mutate(
+    treat = as.integer(Country == "DE"),
+    ttt   = 12 * (year(Month) - year(t0)) + (month(Month) - month(t0))
+  )
+
+step5 <- step4 %>%
+  mutate(
+    transactions_per_active_store = if_else(n_stores_active > 0,
+                                            CheckoutCount / n_stores_active, 0),
+    activation_rate = if_else(n_stores > 0, n_stores_active / n_stores, 0)
+  ) %>%
+  group_by(NUTS3, Country) %>%
+  mutate(w = pmax(mean(n_stores[ttt >= -pre_window & ttt <= -1], na.rm = TRUE), 1)) %>%
+  ungroup()
+
+activity_tl <- step5 %>%
+  filter(n_stores > 0) %>%
+  group_by(NUTS3, Country) %>%
+  summarise(first_active = min(Month), .groups = "drop")
+
+pre_stats <- step5 %>%
+  filter(ttt >= -pre_window, ttt <= -1) %>%
+  group_by(NUTS3, Country) %>%
+  summarise(
+    pre_active_months = sum(n_stores > 0, na.rm = TRUE),
+    pre_mean_outlets  = mean(n_stores, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  left_join(activity_tl, by = c("NUTS3", "Country"))
+
+incumbent_df <- pre_stats %>%
+  filter(
+    pre_active_months >= min_pre_active_months,
+    pre_mean_outlets  >= min_pre_mean_outlets,
+    first_active      <= min_first_active_date
+  ) %>%
+  select(NUTS3, Country) %>%
+  mutate(is_incumbent = 1L)
+
+panel_full <- step5 %>%
+  left_join(incumbent_df, by = c("NUTS3", "Country")) %>%
+  mutate(is_incumbent = replace_na(is_incumbent, 0L)) %>%
+  filter(is_incumbent == 1)
+
+# Munich vs. Vienna comparison
+region_compare <- panel_full %>%
+  filter(
+    NUTS3 %in% c("AT130", "DE212"),
+    Month >= as.Date("2022-05-01"),
+    Month <= as.Date("2024-11-30")
+  ) %>%
+  mutate(label = case_when(
+    NUTS3 == "AT130" ~ "Vienna (AT130) — control",
+    NUTS3 == "DE212" ~ "Munich (DE212) — treated"
+  ))
+```
+
+# Figure: Mechanism 4-panel -----------------------------------------------------------------
+```{r}
+#| label: fig-mechanism
+#| fig-cap: "**Monthly container transaction indicators for Munich (DE212, treated) and Vienna (AT130, control).** a, Total container checkouts per month. b, Active stores per month (stores with at least one transaction). c, Activation rate (share of registered stores with at least one transaction). d, Transactions per active store per month. Blue lines indicate Munich; orange lines indicate Vienna. Vertical dashed line marks mandate implementation (January 2023). Lines represent raw monthly values; no error bars shown."
+#| fig-width: 7.09
+#| fig-height: 5.5
+#| fig-dpi: 300
+#| out-width: "100%"
+
+col_munich <- "#0072B2"
+col_vienna <- "#D55E00"
+
+base_theme <- theme_minimal(base_size = 7) +
+  theme(
+    legend.position  = "bottom",
+    legend.title     = element_blank(),
+    legend.key.width = unit(1.2, "cm"),
+    panel.grid.minor = element_blank(),
+    axis.title.x     = element_blank(),
+    plot.title       = element_text(face = "bold", size = 7.5)
+  )
+
+mandate_line <- geom_vline(
+  xintercept = as.Date("2023-01-01"),
+  linetype = "dashed", color = "grey50", linewidth = 0.45
+)
+
+col_scale <- scale_color_manual(
+  values = c("Munich (DE212) — treated" = col_munich,
+             "Vienna (AT130) — control" = col_vienna)
+)
+
+lty_scale <- scale_linetype_manual(
+  values = c("Munich (DE212) — treated" = "solid",
+             "Vienna (AT130) — control" = "solid")
+)
+
+pA <- ggplot(region_compare,
+             aes(x = Month, y = CheckoutCount, color = label, linetype = label)) +
+  geom_line(linewidth = 0.75) +
+  mandate_line + col_scale + lty_scale +
+  scale_y_continuous(labels = scales::comma) +
+  labs(title = "a  Total container transactions",
+       y = "Checkouts / month") +
+  base_theme
+
+pB <- ggplot(region_compare,
+             aes(x = Month, y = n_stores_active, color = label, linetype = label)) +
+  geom_line(linewidth = 0.75) +
+  mandate_line + col_scale + lty_scale +
+  labs(title = "b  Active stores",
+       y = "Active stores / month") +
+  base_theme
+
+pC <- ggplot(region_compare,
+             aes(x = Month, y = activation_rate, color = label, linetype = label)) +
+  geom_line(linewidth = 0.75) +
+  mandate_line + col_scale + lty_scale +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(title = "c  Activation rate",
+       y = "Share of active stores") +
+  base_theme
+
+pD <- ggplot(region_compare,
+             aes(x = Month, y = transactions_per_active_store,
+                 color = label, linetype = label)) +
+  geom_line(linewidth = 0.75) +
+  mandate_line + col_scale + lty_scale +
+  labs(title = "d  Transactions per active store",
+       y = "Checkouts / active store / month") +
+  base_theme
+
+(pA + pB) / (pC + pD) +
+  plot_layout(guides = "collect") &
+  theme(legend.position = "bottom")
+```

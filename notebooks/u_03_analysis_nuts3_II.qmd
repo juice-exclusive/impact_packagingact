@@ -1,0 +1,257 @@
+---
+title: "Usage: NUTS-3 DiD"
+format:
+  html:
+    toc: true
+    toc-location: left
+---
+
+# Setup -------------------------------------------------------------------------------------
+```{r}
+#| echo: false
+#| message: false
+#| warning: false
+
+if (!requireNamespace("pacman", quietly = TRUE)) {
+  install.packages("pacman", repos = "https://cran.rstudio.com/")
+}
+pacman::p_load(tidyr, dplyr, ggplot2, readr, lubridate, tibble, stringr,
+               knitr, broom, fixest, here)
+```
+
+# Import ------------------------------------------------------------------------------------
+```{r}
+#| echo: false
+load("../data/u_processed/monthly_panel_nuts3_AT_DE_FR.RData")
+nuts3_panel <- monthly_panel_nuts3_AT_DE_FR
+```
+
+# Parameters --------------------------------------------------------------------------------
+```{r}
+#| echo: false
+
+t0 <- as.Date("2023-01-01")  # Intervention date
+
+# Analysis time window
+pre_window  <- 4
+post_window <- 12
+
+# Incumbent market criteria (evaluated over pre-treatment period only)
+min_pre_active_months <- 4
+min_pre_mean_outlets  <- 2
+min_first_active_date <- as.Date("2022-01-01")
+```
+
+# Preprocess: Build balanced panel ----------------------------------------------------------
+
+## Step 1: Filter DE + AT
+```{r}
+#| echo: false
+
+step1_data <- nuts3_panel %>%
+  mutate(Month = as.Date(Month)) %>%
+  filter(Country %in% c("DE", "AT"))
+```
+
+## Step 2: Aggregate duplicates
+```{r}
+#| echo: false
+
+step2_data <- step1_data %>%
+  group_by(NUTS3, Country, Month) %>%
+  summarise(
+    CheckoutCount   = sum(CheckoutCount, na.rm = TRUE),
+    n_stores        = sum(n_stores, na.rm = TRUE),
+    n_stores_active = sum(n_stores_active, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+## Step 3: Create balanced panel
+```{r}
+#| echo: false
+
+all_months      <- sort(unique(step2_data$Month))
+nuts3_country_ids <- step2_data %>% distinct(NUTS3, Country)
+
+step3_data <- tidyr::expand_grid(nuts3_country_ids, Month = all_months) %>%
+  left_join(step2_data, by = c("NUTS3", "Country", "Month")) %>%
+  mutate(
+    CheckoutCount   = replace_na(CheckoutCount, 0L),
+    n_stores        = replace_na(n_stores, 0L),
+    n_stores_active = replace_na(n_stores_active, 0L)
+  )
+```
+
+## Step 4: Add time variables
+```{r}
+#| echo: false
+
+step4_data <- step3_data %>%
+  mutate(
+    treat = as.integer(Country == "DE"),
+    post  = as.integer(Month >= t0),
+    did   = as.integer(treat & post),
+    ttt   = 12 * (year(Month) - year(t0)) + (month(Month) - month(t0)),
+    moy   = as.factor(month(Month))
+  )
+```
+
+## Step 5: Derived variables and weights
+```{r}
+#| echo: false
+
+step5_data <- step4_data %>%
+  mutate(
+    transactions_per_store = if_else(n_stores > 0, CheckoutCount / n_stores, 0),
+    transactions_per_active_store = if_else(n_stores_active > 0,
+                                             CheckoutCount / n_stores_active, 0),
+    activation_rate = if_else(n_stores > 0, n_stores_active / n_stores, 0)
+  ) %>%
+  group_by(NUTS3, Country) %>%
+  mutate(w = pmax(mean(n_stores[ttt >= -pre_window & ttt <= -1], na.rm = TRUE), 1)) %>%
+  ungroup()
+```
+
+## Step 6: Identify incumbent markets
+```{r}
+#| echo: false
+
+activity_timeline <- step5_data %>%
+  filter(n_stores > 0) %>%
+  group_by(NUTS3, Country) %>%
+  summarise(
+    first_active    = min(Month),
+    last_active     = max(Month),
+    n_active_months = n(),
+    .groups = "drop"
+  )
+
+pre_treatment_stats <- step5_data %>%
+  filter(ttt >= -pre_window & ttt <= -1) %>%
+  group_by(NUTS3, Country) %>%
+  summarise(
+    pre_active_months = sum(n_stores > 0, na.rm = TRUE),
+    pre_mean_outlets  = mean(n_stores, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  left_join(activity_timeline, by = c("NUTS3", "Country"))
+
+incumbent_df <- pre_treatment_stats %>%
+  filter(
+    pre_active_months >= min_pre_active_months,
+    pre_mean_outlets  >= min_pre_mean_outlets,
+    first_active      <= min_first_active_date
+  ) %>%
+  select(NUTS3, Country) %>%
+  mutate(is_incumbent = 1L)
+```
+
+## Step 7: Add incumbent flag and create final datasets
+```{r}
+#| echo: false
+
+step7_data <- step5_data %>%
+  left_join(incumbent_df, by = c("NUTS3", "Country")) %>%
+  mutate(is_incumbent = replace_na(is_incumbent, 0L))
+
+# Full balanced panel (all time, incumbent markets only)
+panel_full <- step7_data %>% filter(is_incumbent == 1)
+
+# DiD analysis panel (analysis window, incumbent markets only)
+panel_did <- step7_data %>%
+  filter(is_incumbent == 1, ttt >= -pre_window & ttt <= post_window)
+
+panel_nuts3_DE_AT <- panel_did
+```
+
+# Sample Descriptives -----------------------------------------------------------------------
+```{r}
+#| echo: false
+
+# Average checkout counts over time — for context plot (saved to assets)
+avg_checkouts_DE_AT_full <- panel_full %>%
+  filter(Month >= as.Date("2022-04-01"), Month <= as.Date("2023-12-31")) %>%
+  group_by(Month, Country) %>%
+  summarise(avg_checkout = mean(CheckoutCount, na.rm = TRUE), .groups = "drop")
+
+p_checkout_full <- ggplot(avg_checkouts_DE_AT_full,
+                          aes(x = Month, y = avg_checkout, color = Country)) +
+  geom_line(linewidth = 1) +
+  geom_vline(xintercept = as.numeric(t0), linetype = "dashed", color = "grey40") +
+  scale_color_manual(values = c("DE" = "#0072B2", "AT" = "#D55E00")) +
+  labs(x = "Month", y = "Average Checkout Count") +
+  theme_minimal()
+
+ggsave(here("assets", "objects", "fig-checkout-full-timerange.png"),
+       plot = p_checkout_full, width = 10, height = 6, dpi = 300)
+```
+
+# Model: DiD Event Study (Poisson PPML) -----------------------------------------------------
+```{r}
+#| echo: false
+
+# Load store-level data to count unique stores for sample descriptives
+load("../data/u_processed/monthly_panel_stores_AT_DE_FR.RData")
+
+stores_in_sample <- monthly_panel_stores_AT_DE_FR %>%
+  mutate(Month = as.Date(Month)) %>%
+  filter(
+    Country %in% c("DE", "AT"),
+    NUTS3 %in% unique(panel_nuts3_DE_AT$NUTS3),
+    Month >= min(panel_nuts3_DE_AT$Month),
+    Month <= max(panel_nuts3_DE_AT$Month)
+  )
+
+cat("=== Sample Descriptives for DiD Analysis ===\n\n")
+cat("Region-months:", nrow(panel_nuts3_DE_AT), "\n")
+cat("Unique NUTS3:", n_distinct(panel_nuts3_DE_AT$NUTS3), "\n")
+cat("  DE:", n_distinct(panel_nuts3_DE_AT$NUTS3[panel_nuts3_DE_AT$Country == "DE"]), "\n")
+cat("  AT:", n_distinct(panel_nuts3_DE_AT$NUTS3[panel_nuts3_DE_AT$Country == "AT"]), "\n")
+cat("Total checkouts:", format(sum(panel_nuts3_DE_AT$CheckoutCount), big.mark = ","), "\n")
+cat("Unique stores:", format(n_distinct(stores_in_sample$StoreId), big.mark = ","), "\n")
+```
+
+```{r}
+#| echo: false
+
+mod1_nuts3 <- fepois(
+  CheckoutCount ~ i(ttt, treat, ref = -1) | NUTS3 + Month,
+  cluster = ~NUTS3,
+  data    = panel_nuts3_DE_AT
+)
+
+# Save raw coefficients for supplement table
+did_coef_table <- as.data.frame(coeftable(mod1_nuts3))
+did_coef_table$Term <- rownames(did_coef_table)
+did_coef_table <- did_coef_table %>%
+  select(Term, Estimate, `Std. Error`, `z value`, `Pr(>|z|)`) %>%
+  rename(SE = `Std. Error`, z = `z value`, p = `Pr(>|z|)`)
+
+dir.create(here("assets", "objects"), recursive = TRUE, showWarnings = FALSE)
+saveRDS(did_coef_table, here("assets", "objects", "did_coef_table.rds"))
+```
+
+# Figure: Event Study -----------------------------------------------------------------------
+```{r}
+#| label: fig-event-study
+#| fig-cap: "**The mandate initially increased container transactions but effects reversed from month 4 onward.** Difference-in-differences event-study estimates of mandate effects on monthly container transactions; German NUTS-3 regions (treatment) versus Austrian regions (control); reference period t = −1. Error bars indicate 95% confidence intervals based on standard errors clustered at the NUTS-3 level. Horizontal dashed line at zero indicates no treatment effect; vertical dashed line marks mandate implementation (t = 0). Pre-treatment coefficients (t = −4 to −2) provide a visual test of the parallel trends assumption. n = 388 regions; 6,984 region-months."
+#| fig-width: 10
+#| fig-dpi: 300
+#| warning: false
+#| echo: false
+
+iplot(mod1_nuts3,
+      xlab = "Time to treatment (months)",
+      main = "")
+```
+
+```{r}
+#| echo: false
+
+# Save event-study plot to assets
+png(here::here("assets", "objects", "fig-event-study.png"),
+    width = 10, height = 6, units = "in", res = 300)
+iplot(mod1_nuts3, xlab = "Time to treatment (months)", main = "")
+dev.off()
+```
