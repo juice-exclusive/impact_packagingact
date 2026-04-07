@@ -23,10 +23,9 @@ quarto render notebooks/d_03_analysis_ITSA_II.qmd      # ITSA main results (fig-
 quarto render notebooks/u_03_analysis_nuts3_II.qmd     # DiD event study (fig-event-study)
 quarto render notebooks/u_03_analysis_stores_II.qmd    # cohort analysis (tbl-cohort-full1)
 quarto render notebooks/u_04_mechanism_fig.qmd         # mechanism figure (fig-mechanism-4panel)
-quarto render index.qmd                                # full manuscript
 ```
 
-Precomputed model objects in `assets/objects/` allow rendering `index.qmd` directly without re-estimating models.
+Precomputed model objects in `assets/objects/` allow rendering the notebooks directly without re-estimating models.
 
 ---
 
